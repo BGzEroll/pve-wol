@@ -41,6 +41,9 @@ wakeonlan BC:24:11:AA:BB:CC
 ## 行为与限制
 
 - 启动时同步一次，之后按 `sync_interval` 周期同步；未知 MAC 会触发一次即时同步。
+- 每次处理已知 WoL target 时都会通过 PVE 查询 Guest 的实时运行状态，不使用周期同步中的缓存状态作为最终判断。
+- Guest 迁移导致缓存 Node 失效时会刷新 Registry，并在同一次 WoL 请求中最多恢复重试一次。
+- PVE Template 会被自动忽略，不会读取配置、提取 MAC 或加入 WoL Registry。
 - 同一 MAC 默认 5 秒内只处理一次。
 - 重复 MAC 会记录 warning，并为安全起见拒绝启动该 MAC 对应的 Guest。
 - 仅支持 UDP 标准 Magic Packet；不支持 SecureOn、原始以太网 `0x0842`、IPv6 WoL 或自定义协议。

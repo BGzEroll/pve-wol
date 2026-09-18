@@ -165,20 +165,7 @@ func handleWOL(ctx context.Context, client *pve.Client, reg *registry.Registry, 
 		return
 	}
 
-	entry, ok := reg.Lookup(mac)
-	if !ok {
-		done := make(chan error, 1)
-		request := syncRequest{done: done}
-		select {
-		case syncRequests <- request:
-		case <-ctx.Done():
-			return
-		}
-		if err := waitForSync(ctx, done); err != nil && ctx.Err() == nil {
-			log.Printf("immediate registry sync failed: %v", err)
-		}
-		entry, ok = reg.Lookup(mac)
-	}
+	entry, ok := lookupUnknownGuest(ctx, reg, syncRequests, mac)
 	if !ok {
 		log.Printf("unknown WOL target: %s", mac)
 		return
@@ -190,23 +177,124 @@ func handleWOL(ctx context.Context, client *pve.Client, reg *registry.Registry, 
 
 	guest := entry.Guest
 	log.Printf("WOL received: %s -> %s/%d %s", mac, guest.Type, guest.VMID, guest.Name)
-	if strings.EqualFold(guest.Status, "running") {
-		log.Printf("guest already running, ignoring WOL")
+	recoveryUsed := false
+	status, err := client.Status(ctx, guest)
+	if err != nil {
+		logStatusError(guest, err)
+		recoveryUsed = true
+		entry, ok = refreshGuestMapping(ctx, reg, syncRequests, mac)
+		if !ok {
+			log.Printf("unknown WOL target after refresh: %s", mac)
+			return
+		}
+		if entry.Conflict {
+			log.Printf("warning: ambiguous WOL target %s; refusing to start %s", mac, formatCandidates(entry.Candidates))
+			return
+		}
+		logMappingRefresh(guest, entry.Guest)
+		guest = entry.Guest
+		status, err = client.Status(ctx, guest)
+		if err != nil {
+			log.Printf("failed to get status %s/%d on node %s after refresh: %v", guest.Type, guest.VMID, guest.Node, err)
+			return
+		}
+	}
+	if strings.EqualFold(status, "running") {
+		log.Printf("guest already running, ignoring WOL: %s/%d %s", guest.Type, guest.VMID, guest.Name)
+		reg.MarkRunning(guest)
 		return
 	}
 
+	startErr := requestStart(ctx, client, reg, guest)
+	if startErr == nil {
+		return
+	}
+	log.Printf("failed to start %s/%d: %v", guest.Type, guest.VMID, startErr)
+	if recoveryUsed {
+		return
+	}
+
+	recoveryUsed = true
+	entry, ok = refreshGuestMapping(ctx, reg, syncRequests, mac)
+	if !ok {
+		log.Printf("unknown WOL target after refresh: %s", mac)
+		return
+	}
+	if entry.Conflict {
+		log.Printf("warning: ambiguous WOL target %s; refusing to start %s", mac, formatCandidates(entry.Candidates))
+		return
+	}
+	logMappingRefresh(guest, entry.Guest)
+	guest = entry.Guest
+	status, err = client.Status(ctx, guest)
+	if err != nil {
+		log.Printf("failed to get status %s/%d on node %s after refresh: %v", guest.Type, guest.VMID, guest.Node, err)
+		return
+	}
+	if strings.EqualFold(status, "running") {
+		log.Printf("guest already running, ignoring WOL: %s/%d %s", guest.Type, guest.VMID, guest.Name)
+		reg.MarkRunning(guest)
+		return
+	}
+	if err := requestStart(ctx, client, reg, guest); err != nil {
+		log.Printf("failed to start %s/%d after refresh: %v", guest.Type, guest.VMID, err)
+	}
+}
+
+func lookupUnknownGuest(ctx context.Context, reg *registry.Registry, syncRequests chan<- syncRequest, mac string) (registry.Entry, bool) {
+	entry, ok := reg.Lookup(mac)
+	if ok {
+		return entry, true
+	}
+	if err := requestRegistrySync(ctx, syncRequests); err != nil && ctx.Err() == nil {
+		log.Printf("immediate registry sync failed: %v", err)
+	}
+	return reg.Lookup(mac)
+}
+
+func refreshGuestMapping(ctx context.Context, reg *registry.Registry, syncRequests chan<- syncRequest, mac string) (registry.Entry, bool) {
+	log.Printf("guest mapping may be stale, refreshing registry: %s", mac)
+	if err := requestRegistrySync(ctx, syncRequests); err != nil && ctx.Err() == nil {
+		log.Printf("registry refresh failed: %v", err)
+	}
+	return reg.Lookup(mac)
+}
+
+func requestRegistrySync(ctx context.Context, syncRequests chan<- syncRequest) error {
+	done := make(chan error, 1)
+	request := syncRequest{done: done}
+	select {
+	case syncRequests <- request:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return waitForSync(ctx, done)
+}
+
+func requestStart(ctx context.Context, client *pve.Client, reg *registry.Registry, guest pve.Guest) error {
 	if err := client.Start(ctx, guest); err != nil {
 		var apiErr *pve.APIError
 		if errors.As(err, &apiErr) && apiErr.AlreadyRunning() {
 			log.Printf("warning: guest already running, ignoring WOL: %s/%d %v", guest.Type, guest.VMID, err)
 			reg.MarkRunning(guest)
-			return
+			return nil
 		}
-		log.Printf("failed to start %s/%d: %v", guest.Type, guest.VMID, err)
-		return
+		return err
 	}
 	reg.MarkRunning(guest)
-	log.Printf("started %s/%d %s", guest.Type, guest.VMID, guest.Name)
+	log.Printf("start requested: %s/%d %s", guest.Type, guest.VMID, guest.Name)
+	return nil
+}
+
+func logStatusError(guest pve.Guest, err error) {
+	log.Printf("failed to get status %s/%d on node %s: %v", guest.Type, guest.VMID, guest.Node, err)
+}
+
+func logMappingRefresh(previous, current pve.Guest) {
+	if previous.Type == current.Type && previous.VMID == current.VMID && previous.Node == current.Node {
+		return
+	}
+	log.Printf("guest mapping refreshed: %s/%d %s -> %s/%d %s", previous.Type, previous.VMID, previous.Node, current.Type, current.VMID, current.Node)
 }
 
 func waitForSync(ctx context.Context, done <-chan error) error {

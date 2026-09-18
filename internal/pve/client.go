@@ -45,11 +45,12 @@ type Client struct {
 }
 
 type Resource struct {
-	Type   string `json:"type"`
-	VMID   int    `json:"vmid"`
-	Node   string `json:"node"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	Type     string          `json:"type"`
+	VMID     int             `json:"vmid"`
+	Node     string          `json:"node"`
+	Name     string          `json:"name"`
+	Status   string          `json:"status"`
+	Template json.RawMessage `json:"template"`
 }
 
 type APIError struct {
@@ -112,6 +113,10 @@ func (c *Client) Sync(ctx context.Context) ([]Guest, error) {
 		if typ != "qemu" && typ != "lxc" {
 			continue
 		}
+		if resource.IsTemplate() {
+			log.Printf("skipping template %s/%d %q", typ, resource.VMID, resource.Name)
+			continue
+		}
 		if resource.Node == "" || resource.VMID <= 0 {
 			log.Printf("failed to read %s/%d config: resource has no node or vmid", typ, resource.VMID)
 			continue
@@ -151,8 +156,42 @@ func (c *Client) Start(ctx context.Context, guest Guest) error {
 	return c.do(ctx, http.MethodPost, path, nil)
 }
 
+func (c *Client) Status(ctx context.Context, guest Guest) (string, error) {
+	typ := strings.ToLower(guest.Type)
+	if typ != "qemu" && typ != "lxc" {
+		return "", fmt.Errorf("unsupported guest type %q", guest.Type)
+	}
+	path := fmt.Sprintf("/nodes/%s/%s/%d/status/current", url.PathEscape(guest.Node), typ, guest.VMID)
+	var current struct {
+		Status string `json:"status"`
+	}
+	if err := c.get(ctx, path, &current); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(current.Status) == "" {
+		return "", fmt.Errorf("status/current response did not contain status")
+	}
+	return current.Status, nil
+}
+
 func (c *Client) get(ctx context.Context, path string, out any) error {
 	return c.do(ctx, http.MethodGet, path, out)
+}
+
+func (r Resource) IsTemplate() bool {
+	if len(r.Template) == 0 || string(r.Template) == "null" {
+		return false
+	}
+
+	var number int
+	if err := json.Unmarshal(r.Template, &number); err == nil {
+		return number != 0
+	}
+	var enabled bool
+	if err := json.Unmarshal(r.Template, &enabled); err == nil {
+		return enabled
+	}
+	return false
 }
 
 func (c *Client) do(ctx context.Context, method, path string, out any) error {
