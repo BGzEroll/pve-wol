@@ -1,0 +1,13 @@
+pve:
+  url: "https://192.168.1.2:8006"
+  token_id: "pve-wol@pve!wol"
+  token_secret: "CHANGE_ME"
+  insecure_skip_verify: true
+
+wol:
+  listen:
+    - ":7"
+    - ":9"
+  debounce: 5s
+
+sync_interval: 60s
